@@ -40,7 +40,7 @@ def test_flash_attn():
 
     # 比较结果
     assert torch.allclose(O_ref, O_tri, atol=1e-2)
-    '''
+
     # ref反向传播
     dO = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype)
     O_ref.backward(dO)
@@ -53,15 +53,24 @@ def test_flash_attn():
     O_tri.backward(dO)
     dQ_tri, dK_tri, dV_tri = Q.grad, K.grad, V.grad
     Q.grad, K.grad, V.grad = None, None, None
-    
+    print(dK_ref[0,0,0,:20], dK_tri[0,0,0,:20])
+    print("dQ ratio:", (dQ_tri / dQ_ref).mean().item())                                                                                                                                                                                                                              
+    print("dV ratio:", (dV_tri / dV_ref).mean().item())
+    print("dK ratio:", (dK_tri / dK_ref).mean().item())
     # 比较结果
     assert torch.allclose(dQ_ref, dQ_tri, atol=1e-2)
+    
     assert torch.allclose(dK_ref, dK_tri, atol=1e-2)
     assert torch.allclose(dV_ref, dV_tri, atol=1e-2)
-    '''
 
 # tridon实现的flash attention
 # 在torch中自定义的函数，总是需要继承torch.autograd.Function，并实现静态方法forward和backward
+'''
+从torch.autograd.Function继承的类需要重载两个静态方法：forward和backward。
+forward方法输入模型的输入，输出模型的输出，并保存一些中间结果到ctx
+backward方法输入模型的输出的梯度和ctx，输出模型输入的梯度，并计算所有需要的梯度进行保存
+在调用forward的时候的语法是MyFunc.apply(inputs)，调用backward的时候是output.backward(grad_outputs)
+'''
 class FlashAttn(torch.autograd.Function):
     @staticmethod
     # 这里的ctx是用来在前向传播中保存下用来计算反向传播的中间结果。
@@ -148,6 +157,132 @@ class FlashAttn(torch.autograd.Function):
         ctx.casual_mask = casual_mask
         return O
     
+    @staticmethod
+    def backward(ctx, dO):
+        '''
+        计算反向传播的流程：
+        
+        对于前向传播：
+        S = Q @ K^T * softmax_scale
+        P = softmax(S)
+        O = P @ V
+
+        对于反向传播：
+        我们保存了QKVO和M（logsumexp）用于反向传播
+        我们需要先分块重计算P:
+        S = Q @ K^T * softmax_scale
+        P = exp(S - M)  # 这里的M是logsumexp
+        梯度计算：
+        dP = dO @ V^T
+        dS = P * (dP - sum(dP * P)) # 这里的sum是对所有的K维度求和，乘法是逐元素乘
+        引入一个统计量D
+        D = sum(dP * P) = sum((dO @ V^T) * P) = sum(dO * (P @ V)) = sum(dO * O) # 关键推导
+        通过提前计算D，可以让我们只用一层循环就可以计算出dQdK，因为D表示了softmax梯度反向传播中jacobian的所有非对角元项。
+        化简得
+        dS = P * (dO @ V^T - D)
+        最后计算dQ, dK, dV:
+        dQ = dS @ K * softmax_scale = P * (dO @ V^T - D[:,None]) @ K * softmax_scale
+        dK = dS^T @ Q * softmax_scale = P^T * (dO @ V^T - D[None,:]) @ Q * softmax_scale = P^T * (V @ dO^T - D[None,:]) @ Q * softmax_scale
+        dV = P^T @ dO
+        具体算法见下kernel的实现
+        '''
+        # 从ctx中获取前向传播保存的张量
+        Q, K, V, M, O = ctx.saved_tensors
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+        softmax_scale = ctx.softmax_scale
+        casual_mask = ctx.casual_mask
+
+        # 定义D张量
+        D = torch.empty_like(M)  # D [BATCH_SIZE, NUM_HEADS, SEQ_LEN]
+
+        grid_precompute = lambda args: (
+            triton.cdiv(SEQ_LEN, args['BLOCK_SIZE_Q']), NUM_HEADS * BATCH_SIZE, 1
+        )
+
+        # 先通过一个核函数来precompute D
+        _attn_bwd_precompute[grid_precompute](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+            BATCH_SIZE=BATCH_SIZE,
+            NUM_HEADS=NUM_HEADS,
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_seq=O.stride(2),
+            stride_O_dim=O.stride(3),
+        )
+
+        #  通过一个kernel来计算dQ, dK, dV
+        '''
+        这里我们并行的处理所有Q_block的梯度。对于一个固定的Q_block，我们需要遍历所有的KV_block来累加出dQ，具体公式为：
+        dQ = dS @ K * softmax_scale = P * (dO @ V^T - D[:,None]) @ K * softmax_scale
+        S = Q @ K^T * softmax_scale
+        P = exp(S - M)  # 这里的M是logsumexp
+        同时，我们希望通过一次循环同时也得到dK和dV，具体公式为：
+        dK = P^T * (V @ dO^T - D[None,:]) @ Q * softmax_scale
+        dV = P^T @ dO
+
+        但是由于不同的thread block会访问相同的dK_block和dV_block，因此我们需要使用atomic add来保证不同block写入时不会冲突
+        具体来说，我们需要初始化为0的dK和dV张量，并且传入cuda kernel，在遍历KV_block的过程中计算出部分的dK_block和dV_block，然后通过atomic add写回全局的dK和dV张量
+        '''
+
+        dQ = torch.empty_like(Q)
+        dK = torch.zeros_like(K, dtype=torch.float32)  # 使用float32来减少累加误差，后面再转回float16
+        dV = torch.zeros_like(V, dtype=torch.float32)
+
+        grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args['BLOCK_SIZE_Q']), NUM_HEADS * BATCH_SIZE, 1
+        )
+
+        _attn_bwd_LoopQ[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            D=D,
+            M=M,
+            casual_mask=casual_mask,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_seq=Q.stride(2),
+            stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_seq=K.stride(2),
+            stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_seq=V.stride(2),
+            stride_V_dim=V.stride(3),
+            stride_dK_batch=dK.stride(0),
+            stride_dK_head=dK.stride(1),
+            stride_dK_seq=dK.stride(2),
+            stride_dK_dim=dK.stride(3),
+            stride_dV_batch=dV.stride(0),
+            stride_dV_head=dV.stride(1),
+            stride_dV_seq=dV.stride(2),
+            stride_dV_dim=dV.stride(3),
+            stride_dO_batch=dO.stride(0),
+            stride_dO_head=dO.stride(1),
+            stride_dO_seq=dO.stride(2),
+            stride_dO_dim=dO.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            BATCH_SIZE=BATCH_SIZE,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+            softmax_scale=softmax_scale,
+        )
+
+        # 最后将dK和dV转回原始dtype
+        dK = dK.to(K.dtype)
+        dV = dV.to(V.dtype)
+        return dQ, dK, dV, None
+
 
 # 接下来需要实现前向传播的kernel
 
@@ -161,7 +296,8 @@ class FlashAttn(torch.autograd.Function):
     key=['SEQ_LEN', 'HEAD_DIM'],
 )
 
-# tl.constexpr告诉triton编译器这是一个常量
+# 下面是前向传播的kernel实现
+# tl.constexpr告诉triton编译器这是一个常量，即对于不同的thread block来说，它的值是固定的
 @triton.jit
 def _attn_fwd(
     Q, # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
@@ -215,7 +351,7 @@ def _attn_fwd(
     3. strides：滑窗每个维度的步长
     4. offsets：目前滑窗的窗口的起始位置
     5. block_shape：滑窗窗口的形状
-    6. order：用来告诉triton每个维度的储存优先级，描述维度变化的快慢，从最慢到最快填写自然数0,1,2,...。这个参数的目的是告诉triton如何进行合并访问优化，因为gpu在如果可以一次访问相邻的一段内存，效率最高。
+    6. order：用来告诉triton每个维度的储存优先级，描述维度变化的快慢，从最快变化的维度到最慢变化的维度。这个参数的目的是告诉triton如何进行合并访问优化，因为gpu在如果可以一次访问相邻的一段内存，效率最高。
     '''
 
     Q_block_ptr = tl.make_block_ptr( # 挑选出的切片：Q[batch_idx][head_idx][block_index_q * BLOCK_SIZE_Q : block_index_q * BLOCK_SIZE_Q + BLOCK_SIZE_Q][:]
@@ -224,7 +360,7 @@ def _attn_fwd(
         strides=(stride_Q_seq, stride_Q_dim), # 每个维度的步长
         offsets=(block_q_idx * BLOCK_SIZE_Q, 0), # 当前thread block执行的是哪个Q_block，其他的block_q_idx不在这个program中执行，因此这个滑窗实际上不会滑动
         block_shape=(BLOCK_SIZE_Q, HEAD_DIM), # 每个滑窗的形状
-        order=(0, 1), # head维度是变化最快的
+        order=(1, 0), # head维度是变化最快的
     )
 
     # 为了方便内积，我们需要把K的形状进行转置
@@ -234,7 +370,7 @@ def _attn_fwd(
         strides=(stride_K_dim, stride_K_seq),
         offsets=(0, 0), # 我们需要从序列的一开始进行滑动，通过一个循环来遍历这个滑窗
         block_shape=(HEAD_DIM, BLOCK_SIZE_KV),
-        order=(1, 0),
+        order=(0, 1),
     )
 
     V_block_ptr = tl.make_block_ptr( # 挑选出的切片：V[batch_idx][head_idx][:][:]
@@ -243,7 +379,7 @@ def _attn_fwd(
         strides=(stride_V_seq, stride_V_dim),
         offsets=(0, 0),
         block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
-        order=(0, 1),
+        order=(1, 0),
     )
 
     O_block_ptr = tl.make_block_ptr( # 挑选出的切片：O[batch_idx][head_idx][block_index_q * BLOCK_SIZE_Q : block_index_q * BLOCK_SIZE_Q + BLOCK_SIZE_Q][:]
@@ -252,7 +388,7 @@ def _attn_fwd(
         strides=(stride_O_seq, stride_O_dim),
         offsets=(block_q_idx * BLOCK_SIZE_Q, 0), # 和Q的设定同理，这个滑窗实际上不会滑动
         block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
-        order=(0, 1),
+        order=(1, 0),
     )
 
     '''
@@ -265,7 +401,7 @@ def _attn_fwd(
     m的shape是[BLOCK_SIZE_Q, 1]，l的shape是[BLOCK_SIZE_Q, 1]，o的shape是[BLOCK_SIZE_Q, HEAD_DIM]
 
     在每一步更新的时候，首先更新m，然后用更新后的m去修正l之前的项的和并且加上新的项，然后计算新的O：（遍历i）
-    S_i = Q @ K_i^T / softmax_scale
+    S_i = Q @ K_i^T * softmax_scale
     m_i = max(m_i-1, max(S_i)) 循环到目前的最大值
     P_i = exp(S_i - m_i)
     l_i = l_i-1 * exp(m_i-1 - m_i) + sum(P_i) 
@@ -281,7 +417,7 @@ def _attn_fwd(
     # 通过tl.arange获得一串KV_block对应的idx列表
     offset_kv = tl.arange(0, BLOCK_SIZE_KV)
 
-    # 注意使用float32来保证累加精度
+    # 在SHM中初始化m,l,O_block，注意使用float32来保证累加精度
     m = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float('inf')
     l = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0 # 这里加一个1.0是为了防止如果所有k都被mask掉了，不至于除以0。这里加1不会影响数值结果，因为初态m=-inf，l=1，下一次更新就会把这个1全部衰减掉（exp(-inf)）
     O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32) # 这里O_block创建为fp32类型，为了保证累加精度不丢失，但是最后存回O的时候会转回O的精度类型
@@ -346,14 +482,14 @@ def _attn_fwd(
     O_block = O_block / l[:, None]
     tl.store(O_block_ptr, O_block.to(O.type.element_ty)) # 将O_block数据类型保存为O的数据类型
 
-    # 计算logsumexp并保存到M
+    # 计算logsumexp并保存到M，从而在反向传播时重计算softmax不需要再循环获得归一化系数
     m += tl.math.log(l)
 
     # 用指针m_ptr指向M中正确的batch、head、Q_block起始位置
     m_ptr = M + batch_idx * NUM_HEADS * SEQ_LEN + head_idx * SEQ_LEN + block_q_idx * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     tl.store(m_ptr, m)
 
-
+# 前向传播的分支函数，用来处理不同stage的遍历
 @triton.jit
 def _attn_fwd_inner(
     O_block,
@@ -367,8 +503,8 @@ def _attn_fwd_inner(
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
     stage: tl.constexpr,
-    offset_q: tl.constexpr,
-    offset_kv: tl.constexpr,
+    offset_q,
+    offset_kv,
     SEQ_LEN: tl.constexpr,
 ):
     # 计算遍历的区间（token的idx区间）
@@ -387,7 +523,7 @@ def _attn_fwd_inner(
 
     '''
     接下来遍历完成计算：
-    S_i = Q @ K_i^T / softmax_scale
+    S_i = Q @ K_i^T * softmax_scale
     m_i = max(m_i-1, max(S_i))
     P_i = exp(S_i - m_i)
     l_i = l_i-1 * exp(m_i-1 - m_i) + sum(P_i)
@@ -418,7 +554,7 @@ def _attn_fwd_inner(
         # 计算l_i
         l = l * tl.math.exp(m - m_new) + tl.sum(P_block, axis=1)
 
-        # 计算O_i，为了加速矩阵乘法，先转到fp16（注意前面累加的之后不能转，必须保持为fp32）
+        # 计算O_i，为了加速矩阵乘法，先转到fp16（注意前面累加的时候不能转，必须保持为fp32）
         P_block = P_block.to(tl.float16)
         O_block = O_block * tl.math.exp(m - m_new)[:, None]
         O_block = tl.dot(P_block, V_block, O_block) # 注意这里这种写法的意思就是，直接把P和V的乘法结果加在O上，但是更优化，因为不需要用中间变量来存储P和V的乘法结果
@@ -431,6 +567,404 @@ def _attn_fwd_inner(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
 
     return O_block, l, m
+
+# 反向传播的precompute核函数实现
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_Q': 128}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_Q': 256}, num_warps=8),
+        # ... 更多组合
+    ],
+    key=['SEQ_LEN', 'HEAD_DIM'],
+)
+@triton.jit
+def _attn_bwd_precompute(
+    O, # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    dO, # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    D, # BATCH_SIZE, NUM_HEADS, SEQ_LEN
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BATCH_SIZE: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    stride_O_batch,
+    stride_O_head,
+    stride_O_seq,
+    stride_O_dim,
+):
+    block_q_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1) // NUM_HEADS
+    head_idx = tl.program_id(1) % NUM_HEADS
+
+    # 把O和dO的block ptr构建出来
+    O_block_ptr = tl.make_block_ptr(
+        base=O + batch_idx.to(tl.int64) * stride_O_batch + head_idx.to(tl.int64) * stride_O_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_O_seq, stride_O_dim),
+        offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        base=dO + batch_idx.to(tl.int64) * stride_O_batch + head_idx.to(tl.int64) * stride_O_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_O_seq, stride_O_dim),
+        offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    # 加载dO_block和O_block
+    dO_block = tl.load(dO_block_ptr)
+    O_block = tl.load(O_block_ptr)
+
+    # 计算D
+    D_block = tl.sum(dO_block * O_block, axis=1) # BLOCK_SIZE_Q
+    # 计算offset并将D_block保存到D的正确位置
+    D_ptr = D + batch_idx.to(tl.int64) * NUM_HEADS * SEQ_LEN + head_idx.to(tl.int64) * SEQ_LEN + block_q_idx * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    tl.store(D_ptr, D_block)
+
+# 反向传播的核函数实现
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 128}, num_warps=8),
+        # ... 更多组合
+    ],
+    key=['SEQ_LEN', 'HEAD_DIM'],
+)
+@triton.jit
+def _attn_bwd_LoopQ( # 这里SEQ_LEN的(q)和(k)表示同标记的维度的idx是同步的。
+    Q, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q), HEAD_DIM
+    K, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
+    V, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
+    dO, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q), HEAD_DIM
+    dQ, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q), HEAD_DIM
+    dK, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
+    dV, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
+    D, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
+    M, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
+    casual_mask: tl.constexpr,
+    stride_Q_batch,
+    stride_Q_head,
+    stride_Q_seq,
+    stride_Q_dim,
+    stride_K_batch,
+    stride_K_head,
+    stride_K_seq,
+    stride_K_dim,
+    stride_V_batch,
+    stride_V_head,
+    stride_V_seq,
+    stride_V_dim,
+    stride_dK_batch,
+    stride_dK_head,
+    stride_dK_seq,
+    stride_dK_dim,
+    stride_dV_batch,
+    stride_dV_head,
+    stride_dV_seq,
+    stride_dV_dim,
+    stride_dO_batch,
+    stride_dO_head,
+    stride_dO_seq,
+    stride_dO_dim,
+    NUM_HEADS: tl.constexpr,
+    BATCH_SIZE: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    softmax_scale: tl.constexpr,
+):
+    batch_idx = tl.program_id(1) // NUM_HEADS
+    head_idx = tl.program_id(1) % NUM_HEADS
+    block_q_idx = tl.program_id(0)
+
+    # 建立block ptr
+    '''
+    公式：
+    dQ = P * (dO @ V^T - D[:,None]) @ K * softmax_scale
+    dK = P^T * (V @ dO^T - D[None,:]) @ Q * softmax_scale
+    dV = P^T @ dO
+    其中P = exp(Q @ K^T * softmax_scale - M[:,None])
+    注意K, V的idx是同步的，Q, M, dO, D的idx是同步的
+    '''
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + batch_idx.to(tl.int64) * stride_Q_batch + head_idx.to(tl.int64) * stride_Q_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_Q_seq, stride_Q_dim),
+        offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    D_block_ptr = tl.make_block_ptr(
+        base=D + batch_idx.to(tl.int64) * NUM_HEADS * SEQ_LEN + head_idx.to(tl.int64) * SEQ_LEN,
+        shape=(SEQ_LEN,),
+        strides=(1,),
+        offsets=(block_q_idx * BLOCK_SIZE_Q,),
+        block_shape=(BLOCK_SIZE_Q,),
+        order=(0,),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        base=dO + batch_idx.to(tl.int64) * stride_dO_batch + head_idx.to(tl.int64) * stride_dO_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_dO_seq, stride_dO_dim),
+        offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    M_block_ptr = tl.make_block_ptr(
+        base=M + batch_idx.to(tl.int64) * NUM_HEADS * SEQ_LEN + head_idx.to(tl.int64) * SEQ_LEN,
+        shape=(SEQ_LEN,),
+        strides=(1,),
+        offsets=(block_q_idx * BLOCK_SIZE_Q,),
+        block_shape=(BLOCK_SIZE_Q,),
+        order=(0,),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        base=K + batch_idx.to(tl.int64) * stride_K_batch + head_idx.to(tl.int64) * stride_K_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_K_seq, stride_K_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        base=V + batch_idx.to(tl.int64) * stride_V_batch + head_idx.to(tl.int64) * stride_V_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_V_seq, stride_V_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    # 定义输出block ptr
+    dQ_block_ptr = tl.make_block_ptr(
+        base=dQ + batch_idx.to(tl.int64) * stride_Q_batch + head_idx.to(tl.int64) * stride_Q_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_Q_seq, stride_Q_dim),
+        offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    dK_block_ptr = tl.make_block_ptr(
+        base=dK + batch_idx.to(tl.int64) * stride_K_batch + head_idx.to(tl.int64) * stride_K_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_K_seq, stride_K_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    dV_block_ptr = tl.make_block_ptr(
+        base=dV + batch_idx.to(tl.int64) * stride_V_batch + head_idx.to(tl.int64) * stride_V_head,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_V_seq, stride_V_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    # 初始化dQ_block，注意数据类型为fp32以保证累加精度，后面再转回fp16（dK_block和dV_block后面会用atomic add来累加，因此不需要在这里初始化）
+    dQ_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
+
+    # Q_block, D_block, dO_block, M_block是固定的，可以直接加载到SHM
+    Q_block = tl.load(Q_block_ptr) # BLOCK_SIZE_Q * HEAD_DIM
+    D_block = tl.load(D_block_ptr) # BLOCK_SIZE_Q
+    dO_block = tl.load(dO_block_ptr) # BLOCK_SIZE_Q * HEAD_DIM
+    M_block = tl.load(M_block_ptr) # BLOCK_SIZE_Q
+
+    # 接下来需要处理casual mask的逻辑，和前向传播类似
+    # 同理需要计算offset_q和offset_kv用来生成mask
+    offset_q = tl.arange(0, BLOCK_SIZE_Q) + block_q_idx * BLOCK_SIZE_Q
+    offset_kv = tl.arange(0, BLOCK_SIZE_KV)
+    stage = 3 if casual_mask else 1
+    dQ_block = _attn_bwd_LoopQ_inner(
+        dQ_block,
+        dK_block_ptr,
+        dV_block_ptr,
+        K_block_ptr,
+        V_block_ptr,
+        Q_block,
+        D_block,
+        M_block,
+        dO_block,
+        block_q_idx,
+        softmax_scale,
+        HEAD_DIM,
+        batch_idx,
+        head_idx,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KV,
+        stage,
+        SEQ_LEN,
+        offset_q,
+        offset_kv,
+        dV,
+        dK,
+        stride_dV_batch,
+        stride_dV_head,
+        stride_dV_seq,
+        stride_dV_dim,
+        stride_dK_batch,
+        stride_dK_head,
+        stride_dK_seq,
+        stride_dK_dim,
+    )
+    if stage == 3:
+        dQ_block = _attn_bwd_LoopQ_inner(
+            dQ_block,
+            dK_block_ptr,
+            dV_block_ptr,
+            K_block_ptr,
+            V_block_ptr,
+            Q_block,
+            D_block,
+            M_block,
+            dO_block,
+            block_q_idx,
+            softmax_scale,
+            HEAD_DIM,
+            batch_idx,
+            head_idx,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            2,
+            SEQ_LEN,
+            offset_q,
+            offset_kv,
+            dV,
+            dK,
+            stride_dV_batch,
+            stride_dV_head,
+            stride_dV_seq,
+            stride_dV_dim,
+            stride_dK_batch,
+            stride_dK_head,
+            stride_dK_seq,
+            stride_dK_dim,
+        )
+    
+    # 保存dQ_block
+    tl.store(dQ_block_ptr, dQ_block.to(dQ.type.element_ty))
+
+@triton.jit
+def _attn_bwd_LoopQ_inner(
+    dQ_block,
+    dK_block_ptr,
+    dV_block_ptr,
+    K_block_ptr,
+    V_block_ptr,
+    Q_block,
+    D_block,
+    M_block,
+    dO_block,
+    block_q_idx,
+    softmax_scale,
+    HEAD_DIM: tl.constexpr,
+    batch_idx,
+    head_idx,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    stage: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    offset_q,
+    offset_kv,
+    dV, # 用于atomic add，因为atomic add必须使用普通指针，而不能使用block ptr
+    dK, # 用于atomic add
+    stride_dV_batch, # 用于atomic add
+    stride_dV_head,
+    stride_dV_seq,
+    stride_dV_dim,
+    stride_dK_batch,
+    stride_dK_head, 
+    stride_dK_seq,
+    stride_dK_dim,
+):
+    # 计算遍历的区间（token的idx区间）
+    if stage == 3:
+        lo, hi = 0, block_q_idx * BLOCK_SIZE_Q
+    elif stage == 2:
+        lo, hi = block_q_idx * BLOCK_SIZE_Q, block_q_idx * BLOCK_SIZE_Q + BLOCK_SIZE_Q
+        lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
+    else:
+        lo, hi = 0, SEQ_LEN
+
+    # 先根据lo和hi把K, V, dK, dV的block ptr移动到正确的起始位置上
+    K_block_ptr = tl.advance(K_block_ptr, (lo, 0))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    dK_block_ptr = tl.advance(dK_block_ptr, (lo, 0))
+    dV_block_ptr = tl.advance(dV_block_ptr, (lo, 0))
+
+    for i in range(lo, hi, BLOCK_SIZE_KV):
+        '''
+        计算公式：
+        dQ = P * (dO @ V^T - D[:,None]) @ K * softmax_scale
+        dK = P^T * (V @ dO^T - D[None,:]) @ Q * softmax_scale
+        dV = P^T @ dO
+        其中P = exp(Q @ K^T * softmax_scale - M[:,None])
+        '''
+        i = tl.multiple_of(i, BLOCK_SIZE_KV)
+        # 加载K_block，V_block（未转置）
+        K_block = tl.load(K_block_ptr) # HEAD_DIM * BLOCK_SIZE_KV
+        V_block = tl.load(V_block_ptr) # HEAD_DIM * BLOCK_SIZE_KV
+
+        # 计算S
+        S_block = tl.dot(Q_block, tl.trans(K_block)) * softmax_scale # BLOCK_SIZE_Q * BLOCK_SIZE_KV
+
+        # 按不同stage加mask
+        if stage == 2:
+            mask = offset_q[:, None] >= i + offset_kv[None, :]
+            S_block = tl.where(mask, S_block, -1.0e6)
+
+        # 计算P
+        P_block = tl.math.exp(S_block - M_block[:, None]) # BLOCK_SIZE_Q * BLOCK_SIZE_KV
+
+        # 计算dV_block
+        # 为了加速矩阵乘法，先转到fp16（dO_block已经是fp16了）
+        P_block = P_block.to(tl.float16)
+        dV_block = tl.dot(tl.trans(P_block), dO_block) # BLOCK_SIZE_KV * HEAD_DIM
+        
+        # 计算(dO @ V^T - D[:,None]) * softmax_scale
+        V_dO_block = (tl.dot(dO_block, tl.trans(V_block)) - D_block[:, None]) * softmax_scale # BLOCK_SIZE_Q * BLOCK_SIZE_KV
+        # 逐元素乘P^T
+        temp_block = P_block * V_dO_block  # BLOCK_SIZE_Q * BLOCK_SIZE_KV
+        # 转fp16以加速矩阵乘法
+        temp_block = temp_block.to(tl.float16)
+
+        # 累加到dQ_block
+        dQ_block = tl.dot(temp_block, K_block, dQ_block) # BLOCK_SIZE_Q * HEAD_DIM
+
+        # 计算dK_block
+        dK_block = tl.dot(tl.trans(temp_block), Q_block) # BLOCK_SIZE_KV * HEAD_DIM
+
+        # 将dV_block和dK_block原子性加到全局内存中
+        # 原子加不支持block ptr，所以需要传递基础指针，形状为(BLOCK_SIZE_KV, HEAD_DIM)
+        dV_ptr = dV + batch_idx.to(tl.int64) * stride_dV_batch + head_idx.to(tl.int64) * stride_dV_head + (i + offset_kv[:, None]) * stride_dV_seq + tl.arange(0, HEAD_DIM)[None, :] * stride_dV_dim # BLOCK_SIZE_KV * HEAD_DIM
+        dK_ptr = dK + batch_idx.to(tl.int64) * stride_dK_batch + head_idx.to(tl.int64) * stride_dK_head + (i + offset_kv[:, None]) * stride_dK_seq + tl.arange(0, HEAD_DIM)[None, :] * stride_dK_dim # BLOCK_SIZE_KV * HEAD_DIM
+
+        # 将dV_block和dK_block精度转为fp32
+        dV_block = dV_block.to(tl.float32)
+        dK_block = dK_block.to(tl.float32)
+
+        tl.atomic_add(dV_ptr, dV_block)
+        tl.atomic_add(dK_ptr, dK_block)
+
+        # 更新指针
+        K_block_ptr = tl.advance(K_block_ptr, (BLOCK_SIZE_KV, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        dK_block_ptr = tl.advance(dK_block_ptr, (BLOCK_SIZE_KV, 0))
+        dV_block_ptr = tl.advance(dV_block_ptr, (BLOCK_SIZE_KV, 0))
+
+    return dQ_block
 
 if __name__ == '__main__':
     test_flash_attn()
