@@ -1,4 +1,5 @@
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity 
 import triton
 import triton.language as tl
 
@@ -22,9 +23,9 @@ def ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, casual_mask = Tr
 # 测试torch实现与手写triton的结果一致
 def test_flash_attn():
     # 测试参数
-    BATCH_SIZE = 1
-    NUM_HEADS = 1
-    SEQ_LEN = 256   
+    BATCH_SIZE = 32
+    NUM_HEADS = 12
+    SEQ_LEN = 1024   
     HEAD_DIM = 64
     dtype = torch.float16
     device = torch.device('cuda')
@@ -59,6 +60,80 @@ def test_flash_attn():
     assert torch.allclose(dQ_ref, dQ_tri, atol=5e-2)
     assert torch.allclose(dK_ref, dK_tri, atol=5e-2)
     assert torch.allclose(dV_ref, dV_tri, atol=5e-2)
+
+# 性能测试
+def profile_flash_attn():
+    BATCH_SIZE = 32
+    NUM_HEADS = 12
+    SEQ_LEN = 1024
+    HEAD_DIM = 64
+    dtype = torch.float16
+    device = torch.device('cuda')
+
+    def make_tensors(requires_grad=True):
+        Q = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=requires_grad)
+        K = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=requires_grad)
+        V = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=requires_grad)
+        dO = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype)
+        return Q, K, V, dO
+
+    # 预热
+    for _ in range(3):
+        Q, K, V, dO = make_tensors()
+        ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V).backward(dO)
+        Q, K, V, dO = make_tensors()
+        FlashAttn.apply(Q, K, V, True).backward(dO)
+    torch.cuda.synchronize()
+
+    # ========== 1. Ref Forward ==========
+    Q, K, V, dO = make_tensors()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof1:
+        O = ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V)
+        torch.cuda.synchronize()
+    print("=" * 60)
+    print("Ref Attn Forward")
+    print("=" * 60)
+    print(prof1.key_averages().table())
+
+    # ========== 2. Ref Backward ==========
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof2:
+        O.backward(dO)
+        torch.cuda.synchronize()
+    print("=" * 60)
+    print("Ref Attn Backward")
+    print("=" * 60)
+    print(prof2.key_averages().table())
+
+    # ========== 3. Triton Forward ==========
+    Q, K, V, dO = make_tensors()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof3:
+        O = FlashAttn.apply(Q, K, V, True)
+        torch.cuda.synchronize()
+    print("=" * 60)
+    print("Triton Flash Attn Forward")
+    print("=" * 60)
+    print(prof3.key_averages().table())
+
+    # ========== 4. Triton Backward ==========
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as prof4:
+        O.backward(dO)
+        torch.cuda.synchronize()
+    print("=" * 60)
+    print("Triton Flash Attn Backward")
+    print("=" * 60)
+    print(prof4.key_averages().table())
 
 # tridon实现的flash attention
 # 在torch中自定义的函数，总是需要继承torch.autograd.Function，并实现静态方法forward和backward
@@ -1175,3 +1250,4 @@ def _attn_bwd_LoopKV_inner(
 
 if __name__ == '__main__':
     test_flash_attn()
+    profile_flash_attn()
