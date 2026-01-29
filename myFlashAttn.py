@@ -431,16 +431,16 @@ class FlashAttn(torch.autograd.Function):
 
 # 接下来需要实现前向传播的kernel
 
-# triton.autotune用来自动调优，triton会尝试不同的BLOCK_SIZE_Q和BLOCK_SIZE_KV
+# triton.autotune用来自动调优，triton会尝试不同的BLOCK_SIZE_Q和BLOCK_SIZE_KV，num_stageas表示流水线深度，目的是让load的同时compute
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 128}, num_warps=8),
-        # ... 更多组合
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 128}, num_warps=8, num_stages=3),
     ],
     key=['SEQ_LEN', 'HEAD_DIM'],
 )
-
 # 下面是前向传播的kernel实现
 # tl.constexpr告诉triton编译器这是一个常量，即对于不同的thread block来说，它的值是固定的
 @triton.jit
@@ -773,11 +773,12 @@ def _attn_bwd_precompute(
 # 反向传播的核函数实现
 
 # 遍历Q的核函数
-@triton.autotune(
+@triton.autotune( # 这里BATCH_SIZE_Q和BATCH_SIZE_KV必须相等
     configs=[
-        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4),
-        #triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 32}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_Q': 32, 'BLOCK_SIZE_KV': 32}, num_warps=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_Q': 32, 'BLOCK_SIZE_KV': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
         # ... 更多组合
     ],
     key=['SEQ_LEN', 'HEAD_DIM'],
@@ -1048,9 +1049,10 @@ def _attn_bwd_LoopQ_inner(
 # 遍历KV的核函数
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4),
-        #triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 32}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_Q': 32, 'BLOCK_SIZE_KV': 32}, num_warps=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_Q': 32, 'BLOCK_SIZE_KV': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
         # ... 更多组合
     ],
     key=['SEQ_LEN', 'HEAD_DIM'],
