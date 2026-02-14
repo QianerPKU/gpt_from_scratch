@@ -5,7 +5,7 @@ import triton.language as tl
 import time
 
 # torch实现的attention，用于结果对比
-def ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, casual_mask = True, dtype = torch.float16):
+def ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, causal_mask = True, dtype = torch.float16):
     # Q: [B, NUM_HEADS, SEQ_LEN, HEAD_DIM]
     # K: [B, NUM_HEADS, SEQ_LEN, HEAD_DIM]
     # V: [B, NUM_HEADS, SEQ_LEN, HEAD_DIM]
@@ -13,7 +13,7 @@ def ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, casual_mask = Tr
     # torch.matmul默认将第一个张量的最后一个维度和第二个张量的倒数第二个维度进行矩阵乘法，前N-2个维度进行广播
     P = torch.matmul(Q,K.transpose(2,3)) / (HEAD_DIM ** 0.5)  # [B, NUM_HEADS, SEQ_LEN(Q), SEQ_LEN(K)]
     # torch.tril 返回矩阵的下三角部分（包括对角线），其余部分设为0，用于产生因果掩码
-    if casual_mask:
+    if causal_mask:
         MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device=Q.device))
         P = P.masked_fill(MASK == 0, float('-inf'))
     # 计算softmax后结果，softmax中的累加操作是fp32的，最后需要转回dtype
@@ -35,7 +35,7 @@ def test_flash_attn():
     V = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype).requires_grad_()
 
     # ref前向传播
-    O_ref = ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, casual_mask=True, dtype=dtype)
+    O_ref = ref_attn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, Q, K, V, causal_mask=True, dtype=dtype)
 
     # triton前向传播
     O_tri = FlashAttn.apply(Q, K, V, True)
@@ -193,7 +193,7 @@ backward方法输入模型的输出的梯度和ctx，输出模型输入的梯度
 class FlashAttn(torch.autograd.Function):
     @staticmethod
     # 这里的ctx是用来在前向传播中保存下用来计算反向传播的中间结果。
-    def forward(ctx, Q, K, V, casual_mask=True):
+    def forward(ctx, Q, K, V, causal_mask=True):
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
         #标准化缩放
         softmax_scale = 1.0 / (HEAD_DIM ** 0.5)
@@ -264,7 +264,7 @@ class FlashAttn(torch.autograd.Function):
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
-            casual_mask=casual_mask,
+            causal_mask=causal_mask,
             softmax_scale=softmax_scale,
         )
 
@@ -273,7 +273,7 @@ class FlashAttn(torch.autograd.Function):
         # 存下grid来在反向传播阶段使用和前向传播相同的并行调度逻辑
         ctx.grid = grid
         ctx.softmax_scale = softmax_scale
-        ctx.casual_mask = casual_mask
+        ctx.causal_mask = causal_mask
         return O
     
     @staticmethod
@@ -309,7 +309,7 @@ class FlashAttn(torch.autograd.Function):
         Q, K, V, M, O = ctx.saved_tensors
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
         softmax_scale = ctx.softmax_scale
-        casual_mask = ctx.casual_mask
+        causal_mask = ctx.causal_mask
 
         # 定义D张量
         D = torch.empty_like(M)  # D [BATCH_SIZE, NUM_HEADS, SEQ_LEN]
@@ -331,6 +331,10 @@ class FlashAttn(torch.autograd.Function):
             stride_O_head=O.stride(1),
             stride_O_seq=O.stride(2),
             stride_O_dim=O.stride(3),
+            stride_dO_batch=dO.stride(0),
+            stride_dO_head=dO.stride(1),
+            stride_dO_seq=dO.stride(2),
+            stride_dO_dim=dO.stride(3),
         )
 
         #  通过一个kernel来计算dQ, dK, dV
@@ -359,7 +363,7 @@ class FlashAttn(torch.autograd.Function):
             dV=dV,
             D=D,
             M=M,
-            casual_mask=casual_mask,
+            causal_mask=causal_mask,
             stride_Q_batch=Q.stride(0),
             stride_Q_head=Q.stride(1),
             stride_Q_seq=Q.stride(2),
@@ -402,7 +406,7 @@ class FlashAttn(torch.autograd.Function):
             dQ=dQ,
             D=D,
             M=M,
-            casual_mask=casual_mask,
+            causal_mask=causal_mask,
             stride_Q_batch=Q.stride(0),
             stride_Q_head=Q.stride(1),
             stride_Q_seq=Q.stride(2),
@@ -472,7 +476,7 @@ def _attn_fwd(
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
-    casual_mask: tl.constexpr,
+    causal_mask: tl.constexpr,
     softmax_scale: tl.constexpr,
 ):
     # 在矩阵乘法中，经常保持收缩维度的尺寸大于等于参与计算的分块大小，这样可以更好的利用性能和减少SRAM浪费。通过搭配triton的autotune，自动剪枝出符合要求的尺寸，加快autotune的速度
@@ -556,7 +560,7 @@ def _attn_fwd(
     O_i = O_i / l_i
     '''
     
-    # 这里需要再显式获得qkv在整个滑窗内的offset，即使已经有了block ptr，我们还需要这个offset来处理casual mask，待会就能看到用处
+    # 这里需要再显式获得qkv在整个滑窗内的offset，即使已经有了block ptr，我们还需要这个offset来处理causal mask，待会就能看到用处
     # 通过tl.arange获得一串Q_block对应的idx列表
     offset_q = block_q_idx * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     # 通过tl.arange获得一串KV_block对应的idx列表
@@ -571,13 +575,13 @@ def _attn_fwd(
     Q_block = tl.load(Q_block_ptr)
 
     '''
-    接下来，处理casual mask的逻辑
+    接下来，处理causal mask的逻辑
 
-    对于casual_mask=True的情况，需要区分三类情况，并用stage参数来区分：
+    对于causal_mask=True的情况，需要区分三类情况，并用stage参数来区分：
     1. 当前的Q_block中所有token的index都大于等于当前KV_block中所有token的index时，我们称这种情况为stage=3
     2. 当前的Q_block中部分token的index大于等于部分KV_block中token的index时，我们称这种情况为stage=2
     3. 当前的Q_block中所有token的index都小于当前KV_block中所有token的index时，这样的情况我们直接不发送给cuda kernel从而节省计算
-    对于casual_mask=False的情况，stage=1
+    对于causal_mask=False的情况，stage=1
 
     对于stage=1的情况，直接从头到尾遍历KV_block
     对于stage=3的情况，首先从头到最后一个满足Q_block中所有token位于KV_block的所有token之后的KV_block开始遍历，并且遍历时不需要考虑mask
@@ -585,8 +589,8 @@ def _attn_fwd(
     我们用一个函数来实现上述三种情况
     '''
 
-    # 无论是casual_mask=True还是casual_mask=False，都要先执行无mask的遍历，只不过遍历的区间不一样
-    stage = 3 if casual_mask else 1
+    # 无论是causal_mask=True还是causal_mask=False，都要先执行无mask的遍历，只不过遍历的区间不一样
+    stage = 3 if causal_mask else 1
     O_block, l, m = _attn_fwd_inner(
         O_block,
         l,
@@ -604,7 +608,7 @@ def _attn_fwd(
         SEQ_LEN,
     )
 
-    # 对于casual_mask=True的情况，再执行stage=2的遍历
+    # 对于causal_mask=True的情况，再执行stage=2的遍历
     if stage == 3:
         O_block, l, m = _attn_fwd_inner(
             O_block,
@@ -736,6 +740,10 @@ def _attn_bwd_precompute(
     stride_O_head,
     stride_O_seq,
     stride_O_dim,
+    stride_dO_batch,
+    stride_dO_head,
+    stride_dO_seq,
+    stride_dO_dim,
 ):
     block_q_idx = tl.program_id(0)
     batch_idx = tl.program_id(1) // NUM_HEADS
@@ -754,7 +762,7 @@ def _attn_bwd_precompute(
     dO_block_ptr = tl.make_block_ptr(
         base=dO + batch_idx.to(tl.int64) * stride_O_batch + head_idx.to(tl.int64) * stride_O_head,
         shape=(SEQ_LEN, HEAD_DIM),
-        strides=(stride_O_seq, stride_O_dim),
+        strides=(stride_dO_seq, stride_dO_dim),
         offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
         block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
         order=(1, 0),
@@ -793,7 +801,7 @@ def _attn_bwd_LoopQ( # 这里SEQ_LEN的(q)和(k)表示同标记的维度的idx�
     dV, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
     D, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
     M, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
-    casual_mask: tl.constexpr,
+    causal_mask: tl.constexpr,
     stride_Q_batch,
     stride_Q_head,
     stride_Q_seq,
@@ -911,11 +919,11 @@ def _attn_bwd_LoopQ( # 这里SEQ_LEN的(q)和(k)表示同标记的维度的idx�
     K_block = tl.load(K_block_ptr) # BLOCK_SIZE_KV * HEAD_DIM
     V_block = tl.load(V_block_ptr) # BLOCK_SIZE_KV * HEAD_DIM
 
-    # 接下来需要处理casual mask的逻辑，和前向传播类似
+    # 接下来需要处理causal mask的逻辑，和前向传播类似
     # 同理需要计算offset_q和offset_kv用来生成mask
     offset_q = tl.arange(0, BLOCK_SIZE_Q)
     offset_kv = tl.arange(0, BLOCK_SIZE_KV) + block_kv_idx * BLOCK_SIZE_KV
-    stage = 3 if casual_mask else 1
+    stage = 3 if causal_mask else 1
     dK_block, dV_block = _attn_bwd_LoopQ_inner(
         dK_block,
         dV_block,
@@ -1066,7 +1074,7 @@ def _attn_bwd_LoopKV( # 这里SEQ_LEN的(q)和(k)表示同标记的维度的idx�
     dQ, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(k), HEAD_DIM
     D, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
     M, # BATCH_SIZE, NUM_HEADS, SEQ_LEN(q)
-    casual_mask: tl.constexpr,
+    causal_mask: tl.constexpr,
     stride_Q_batch,
     stride_Q_head,
     stride_Q_seq,
@@ -1176,11 +1184,11 @@ def _attn_bwd_LoopKV( # 这里SEQ_LEN的(q)和(k)表示同标记的维度的idx�
     dO_block = tl.load(dO_block_ptr)
     M_block = tl.load(M_block_ptr)
 
-    # 接下来需要处理casual mask的逻辑，和前向传播类似
+    # 接下来需要处理causal mask的逻辑，和前向传播类似
     # 同理需要计算offset_q和offset_kv用来生成mask
     offset_q = tl.arange(0, BLOCK_SIZE_Q) + block_q_idx * BLOCK_SIZE_Q
     offset_kv = tl.arange(0, BLOCK_SIZE_KV)
-    stage = 3 if casual_mask else 1
+    stage = 3 if causal_mask else 1
     dQ_block = _attn_bwd_LoopKV_inner(
         dQ_block,
         K_block_ptr,
@@ -1296,6 +1304,11 @@ def _attn_bwd_LoopKV_inner(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
 
     return dQ_block
+
+# api
+
+def apply_flash_attn(q, k, v, causal_mask=True):
+    return FlashAttn()(q, k, v, causal_mask)
 
 if __name__ == '__main__':
     test_flash_attn()
