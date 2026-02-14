@@ -30,7 +30,5 @@ class GPTModel(nn.Module):
             hidden_states = layer(hidden_states)
         hidden_states = self.final_norm(hidden_states)
         
-        # 现在的hidden_states经过最后的mlp后sequence维度是被scatter的状态，因此我们最终需要将其gather
-        hidden_states = gather_from_sequence_parallel_region(hidden_states)
         logits = self.output(hidden_states)
         return logits

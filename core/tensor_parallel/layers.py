@@ -20,7 +20,6 @@ class ColumnParallelLinear(nn.Module):
         # 这里的input_size和output_size都是没切片的尺寸
         self.input_size = input_size
         self.output_size = output_size
-        self.bias = bias
 
         world_size = get_tensor_model_parallel_world_size()
         rank = get_tensor_model_parallel_group_rank()
@@ -55,10 +54,7 @@ class RowParallelLinear(nn.Module):
         super(RowParallelLinear, self).__init__()
 
         self.input_size = input_size
-        self.output_size = output_size
-
-        # 注意，本层中的bias是指reduce后加上的bias
-        self.bias = bias
+        self.output_size = output_size  
 
         world_size = get_tensor_model_parallel_world_size()
         rank = get_tensor_model_parallel_group_rank()
@@ -69,6 +65,7 @@ class RowParallelLinear(nn.Module):
         # 初始化权重
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size_per_partition, device=torch.cuda.current_device(), dtype=torch.float32))
 
+        # 注意，本层中的bias是指reduce后加上的bias
         if bias:
             self.bias = nn.Parameter(torch.empty(self.output_size, device=torch.cuda.current_device(), dtype=torch.float32))
         else:

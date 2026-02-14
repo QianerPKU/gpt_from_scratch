@@ -75,10 +75,10 @@ def profile_flash_attn():
     torch.manual_seed(random_seed)
 
     def make_tensors():
-        Q = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
-        K = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
-        V = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
-        dO = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype)
+        Q = torch.randn((SEQ_LEN, BATCH_SIZE, NUM_HEADS, HEAD_DIM), device=device, dtype=dtype, requires_grad=True).permute(1, 2, 0, 3)
+        K = torch.randn((SEQ_LEN, BATCH_SIZE, NUM_HEADS, HEAD_DIM), device=device, dtype=dtype, requires_grad=True).permute(1, 2, 0, 3)
+        V = torch.randn((SEQ_LEN, BATCH_SIZE, NUM_HEADS, HEAD_DIM), device=device, dtype=dtype, requires_grad=True).permute(1, 2, 0, 3)
+        dO = torch.randn((SEQ_LEN, BATCH_SIZE, NUM_HEADS, HEAD_DIM), device=device, dtype=dtype).permute(1, 2, 0, 3)
         return Q, K, V, dO
 
     # 包装 ref_attn 便于 compile
@@ -199,6 +199,12 @@ class FlashAttn(torch.autograd.Function):
         softmax_scale = 1.0 / (HEAD_DIM ** 0.5)
         # 检查QKV形状一致
         assert Q.shape == K.shape == V.shape
+
+        # 确保连续
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+
         # 定义输出张量，并自动继承Q的形状、device、dtype和layout（内存布局）
         O = torch.empty_like(Q)
 
@@ -760,7 +766,7 @@ def _attn_bwd_precompute(
     )
 
     dO_block_ptr = tl.make_block_ptr(
-        base=dO + batch_idx.to(tl.int64) * stride_O_batch + head_idx.to(tl.int64) * stride_O_head,
+        base=dO + batch_idx.to(tl.int64) * stride_dO_batch + head_idx.to(tl.int64) * stride_dO_head,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_dO_seq, stride_dO_dim),
         offsets=(block_q_idx * BLOCK_SIZE_Q, 0),
@@ -1308,7 +1314,7 @@ def _attn_bwd_LoopKV_inner(
 # api
 
 def apply_flash_attn(q, k, v, causal_mask=True):
-    return FlashAttn()(q, k, v, causal_mask)
+    return FlashAttn.apply(q, k, v, causal_mask)
 
 if __name__ == '__main__':
     test_flash_attn()
