@@ -5,11 +5,14 @@ import torch.nn as nn
 
 class RotaryEmbedding(nn.Module):
     '''用来计算cos和sin，并传给rope直接使用。cos和sin只需要计算一次就可以缓存到buffer里面，并且在seq_len超出已缓存的范围时重新动态计算'''
-    def __init__(self, head_dim, max_position_embeddings=2048, base=10000.0, device=torch.cuda.current_device()):
+    def __init__(self, head_dim, max_position_embeddings=2048, base=10000.0, device=None):
         super().__init__()
         self.head_dim = head_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+
+        if device is None:
+            device = torch.cuda.current_device()
 
         # rope计算公式：freq_i = base ^ (-2i / head_dim) 这里的2i指的是head_dim第2i维和2i+1维转的角度
         # 注意精度要为float32，保证三角函数的计算精度
