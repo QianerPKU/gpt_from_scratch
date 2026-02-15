@@ -66,20 +66,23 @@ def warmup_triton(args):
     head_dim = args.hidden_size // num_heads
     B, S = 2, min(args.seq_len, 256)
 
-    for dtype in [torch.float32, torch.bfloat16]:
-        for nh in set([num_heads // tp_size, num_heads]):
-            q = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
-            k = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
-            v = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
-            o = apply_flash_attn(q, k, v)
-            o.backward(torch.randn_like(o))
+    # 只预热 bf16（训练实际使用的 dtype）
+    # fp32 不需要预热：模型参数和计算全部在 bf16 下，且 fp32 的大 block 配置
+    # 在 shared memory 较小的 GPU 上会超出硬件限制（如 99KB shared memory）
+    dtype = torch.bfloat16
+    for nh in set([num_heads // tp_size, num_heads]):
+        q = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
+        k = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
+        v = torch.randn(B, nh, S, head_dim, device='cuda', dtype=dtype, requires_grad=True)
+        o = apply_flash_attn(q, k, v)
+        o.backward(torch.randn_like(o))
 
-        for nh in set([num_heads // tp_size, num_heads]):
-            x = torch.randn(S, B, nh, head_dim, device='cuda', dtype=dtype, requires_grad=True)
-            cos = torch.randn(S, head_dim // 2, device='cuda', dtype=dtype)
-            sin = torch.randn(S, head_dim // 2, device='cuda', dtype=dtype)
-            out = apply_rope(x, cos, sin)
-            out.backward(torch.randn_like(out))
+    for nh in set([num_heads // tp_size, num_heads]):
+        x = torch.randn(S, B, nh, head_dim, device='cuda', dtype=dtype, requires_grad=True)
+        cos = torch.randn(S, head_dim // 2, device='cuda', dtype=dtype)
+        sin = torch.randn(S, head_dim // 2, device='cuda', dtype=dtype)
+        out = apply_rope(x, cos, sin)
+        out.backward(torch.randn_like(out))
 
     torch.cuda.synchronize()
 

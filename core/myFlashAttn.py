@@ -446,6 +446,8 @@ class FlashAttn(torch.autograd.Function):
 # triton.autotune用来自动调优，triton会尝试不同的BLOCK_SIZE_Q和BLOCK_SIZE_KV，num_stageas表示流水线深度，目的是让load的同时compute
 @triton.autotune(
     configs=[
+        triton.Config({'BLOCK_SIZE_Q': 32, 'BLOCK_SIZE_KV': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_Q': 64, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 64}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_SIZE_Q': 128, 'BLOCK_SIZE_KV': 128}, num_warps=8, num_stages=2),
@@ -728,6 +730,7 @@ def _attn_fwd_inner(
 # 反向传播的precompute核函数实现
 @triton.autotune(
     configs=[
+        triton.Config({'BLOCK_SIZE_Q': 64}, num_warps=4),
         triton.Config({'BLOCK_SIZE_Q': 128}, num_warps=4),
         triton.Config({'BLOCK_SIZE_Q': 256}, num_warps=8),
         # ... 更多组合
