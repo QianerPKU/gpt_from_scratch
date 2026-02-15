@@ -1,0 +1,6 @@
+torch>=2.0.0
+triton>=2.1.0
+numpy
+datasets
+transformers
+tqdm
