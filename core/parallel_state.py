@@ -54,9 +54,7 @@ def initialize_parallel_state(tensor_model_parallel_size,):
 
     # 初始化dp groups
     for i in range(tensor_model_parallel_size):
-        start_rank = i * data_parallel_size
-        end_rank = (i + 1) * data_parallel_size
-        ranks=list(range(start_rank, end_rank))
+        ranks=list(range(i, world_size, tensor_model_parallel_size))
         data_parallel_group = dist.new_group(ranks=ranks)
         if rank in ranks:
             _DATA_PARALLEL_GROUP = data_parallel_group

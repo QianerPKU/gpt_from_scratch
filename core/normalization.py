@@ -8,7 +8,7 @@ class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size), device=torch.cuda.current_device(), dtype=torch.float32)
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=torch.cuda.current_device(), dtype=torch.float32))
 
     def forward(self, x):
         # 需要用fp32计算二阶矩，因此先保存输入的dtype最后再转回来

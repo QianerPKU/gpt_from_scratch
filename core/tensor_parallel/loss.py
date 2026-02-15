@@ -4,7 +4,7 @@ import torch.distributed as dist
 from core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_group_rank, get_tensor_model_parallel_world_size
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
-    '''实现tp的cross entropy loss，继承自torch.autograd.Function，也是tp并行计算的'''
+    '''实现tp的cross entropy loss，继承自torch.autograd.Function，也是tp并行计算的。输入的logits形状：[B, S, V/P]，target形状：[B, S]'''
     @staticmethod
     def forward(ctx, logits, target):
         # logits: [sequence_length, batch_size, vocab_size / TP world size]
