@@ -1,4 +1,4 @@
-# 提供了可以forward和backward的通讯操作封装
+'''提供了可以forward和backward的通讯操作封装'''
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
@@ -48,9 +48,11 @@ def _split_along_first_dim(input_):
 
 # autograd function封装
 
-# 用于SP时线性变换的输入时，将第一个维度做gather，然后再切分进行线性变换（此时的输入的sequence维度已被切分）
-# 当反向传播时，要将切分的结果reduce，并scatter到sequence维度
 class _GatherFromSequenceParallelRegion(Function):
+    '''
+    用于SP时线性变换的输入时，将第一个维度做gather，然后再切分进行线性变换（此时的输入的sequence维度已被切分）。
+    当反向传播时，要将切分的结果reduce，并scatter到sequence维度。
+    '''
     @staticmethod
     def forward(ctx, input_):
         return _gather_along_first_dim(input_)
@@ -58,9 +60,11 @@ class _GatherFromSequenceParallelRegion(Function):
     def backward(ctx, grad_output):
         return _reduce_scatter_along_first_dim(grad_output)
     
-# 用于SP时线性变换的输出，将第一个维度做reduce scatter
-# 反向传播时，直接将结果gather
 class _ReduceScatterToSequenceParallelRegion(Function):
+    '''
+    用于SP时线性变换的输出，将第一个维度做reduce scatter。
+    反向传播时，直接将结果gather。
+    '''
     @staticmethod
     def forward(ctx, input_):
         return _reduce_scatter_along_first_dim(input_)
@@ -68,9 +72,11 @@ class _ReduceScatterToSequenceParallelRegion(Function):
     def backward(ctx, grad_output):
         return _gather_along_first_dim(grad_output)
     
-# 当输入的是完整序列，需要在sequence维度上切分，然后做layernorm或者dropout等。是整个SP流程的入口
-# 反向传播这是gather
 class _ScatterToSequenceParallelRegion(Function):
+    '''
+    当输入的是完整序列，需要在sequence维度上切分，然后做layernorm或者dropout等。是整个SP流程的入口。
+    反向传播时是gather。
+    '''
     @staticmethod
     def forward(ctx, input_):
         return _split_along_first_dim(input_)
@@ -80,10 +86,22 @@ class _ScatterToSequenceParallelRegion(Function):
     
 # public api，用来调用前向传播
 def gather_from_sequence_parallel_region(input_):
+    '''
+    用于SP时线性变换的输入时，将第一个维度做gather，然后再切分进行线性变换（此时的输入的sequence维度已被切分）。
+    当反向传播时，要将切分的结果reduce，并scatter到sequence维度。
+    '''
     return _GatherFromSequenceParallelRegion.apply(input_)
 
 def reduce_scatter_to_sequence_parallel_region(input_):
+    '''
+    用于SP时线性变换的输出，将第一个维度做reduce scatter。
+    反向传播时，直接将结果gather。
+    '''
     return _ReduceScatterToSequenceParallelRegion.apply(input_)
 
 def scatter_to_sequence_parallel_region(input_):
+    '''
+    当输入的是完整序列，需要在sequence维度上切分，然后做layernorm或者dropout等。是整个SP流程的入口。
+    反向传播时是gather。
+    '''
     return _ScatterToSequenceParallelRegion.apply(input_)

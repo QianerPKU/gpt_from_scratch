@@ -1,4 +1,4 @@
-# 组装attention和mlp层等（TP）
+'''组装attention和mlp层等（TP）'''
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ from core.mlp import ParallelMLP
 from core.normalization import RMSNorm
 
 class ParallelAttention(nn.Module):
+    '''输入hidden_states，做qkv投影，然后做rope，然后做flash attention，最后做out proj（TP）'''
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -66,6 +67,7 @@ class ParallelAttention(nn.Module):
         return output
     
 class TransformerLayer(nn.Module):
+    '''完整的transformer block，包括layer norm和dropout和两个残差连接'''
     def __init__(self, layer_id, config):
         super().__init__()
         self.layer_id = layer_id

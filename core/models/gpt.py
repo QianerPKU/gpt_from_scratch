@@ -1,4 +1,4 @@
-# 组装好的gptmodel，输入是[B, S]，内容是每个token的embedding_id，输出是[B, S, V/P]，内容是logits（tp切分后的）
+'''组装好的gptmodel，输入是[B, S]，内容是每个token的embedding_id，输出是[B, S, V/P]，内容是logits（tp切分后的）'''
 import torch
 import torch.nn as nn
 
@@ -8,6 +8,7 @@ from core.transformer_layer import TransformerLayer
 from core.normalization import RMSNorm
 
 class GPTModel(nn.Module):
+    '''组装好的gptmodel，输入是[B, S]，内容是每个token的embedding_id，输出是[B, S, V/P]，内容是logits（tp切分后的）'''
     def __init__(self, config):
         super().__init__()
         self.config = config

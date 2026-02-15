@@ -1,4 +1,4 @@
-# 这个程序用来实现tp相关的线性层，例如列并行线性层和行并行线性层和词表并行
+'''这个程序用来实现tp相关的线性层，例如列并行线性层和行并行线性层和词表并行'''
 
 import torch
 import torch.nn as nn
@@ -12,8 +12,8 @@ from core.parallel_state import (
     get_tensor_model_parallel_group_rank
 )
 
-# 列并行，用在attention的QKV投影上，以及MLP的第一个线性层
 class ColumnParallelLinear(nn.Module):
+    '''列并行线性层，用在attention的QKV投影上，以及MLP的第一个线性层（参数初始化在这）'''
     def __init__(self, input_size, output_size, bias=True, init_method=init.xavier_uniform_):
         super(ColumnParallelLinear, self).__init__()
 
@@ -48,8 +48,8 @@ class ColumnParallelLinear(nn.Module):
 
         return output_parallel
     
-# 列并行，用在attention的输出投影，以及MLP的最后一个线性层
 class RowParallelLinear(nn.Module):
+    '''列并行，用在attention的输出投影，以及MLP的最后一个线性层（参数初始化在这）'''
     def __init__(self, input_size, output_size, bias=True, init_method=init.xavier_uniform_):
         super(RowParallelLinear, self).__init__()
 
@@ -89,8 +89,8 @@ class RowParallelLinear(nn.Module):
 
         return output
 
-# 词表并行，即看对应token的idx是不是在本rank负责范围内，如果是就查表，否则置零，最后reduce scatter
 class VocabParallelEmbedding(nn.Module):
+    '''词表并行，即看对应token的idx是不是在本rank负责范围内，如果是就查表，否则置零，最后reduce scatter（参数初始化在这）'''
     def __init__(self, num_embeddings, embedding_dim, init_method=init.xavier_uniform_):
         super(VocabParallelEmbedding, self).__init__()
 

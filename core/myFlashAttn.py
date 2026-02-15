@@ -1,3 +1,4 @@
+'''triton实现的flash attention，输入proj并位置编码好的qkv，输出未out proj的o。没有任何参数'''
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity 
 import triton
@@ -191,6 +192,7 @@ backward方法输入模型的输出的梯度和ctx，输出模型输入的梯度
 在调用forward的时候的语法是MyFunc.apply(inputs)，调用backward的时候是output.backward(grad_outputs)
 '''
 class FlashAttn(torch.autograd.Function):
+    '''triton实现的flash attention，继承自torch.autograd.Function，输入proj并位置编码好的qkv，输出未out proj的o。没有任何参数'''
     @staticmethod
     # 这里的ctx是用来在前向传播中保存下用来计算反向传播的中间结果。
     def forward(ctx, Q, K, V, causal_mask=True):

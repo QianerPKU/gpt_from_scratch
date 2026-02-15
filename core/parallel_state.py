@@ -1,3 +1,7 @@
+'''
+为每个rank分配到tp和dp的group。
+这是一个dist的变量，在之后调用nccl的通讯指令时需要通过这个变量来确定自己的group和rank。
+'''
 import torch
 import torch.distributed as dist
 

@@ -1,4 +1,4 @@
-# tp实现的mlp层，采用SwiGLU门控激活函数
+'''tp实现的mlp层，采用SwiGLU门控激活函数'''
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
 class ParallelMLP(nn.Module):
+    '''tp实现的mlp层(nn.Module)，采用SwiGLU门控激活函数'''
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size

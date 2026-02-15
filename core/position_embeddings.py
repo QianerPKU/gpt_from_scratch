@@ -1,9 +1,10 @@
-# 用来计算cos和sin，并传给rope直接使用。cos和sin只需要计算一次就可以缓存下来
+'''用来计算cos和sin，并传给rope直接使用。cos和sin只需要计算一次就可以缓存到buffer里面，并且在seq_len超出已缓存的范围时重新动态计算'''
 
 import torch
 import torch.nn as nn
 
 class RotaryEmbedding(nn.Module):
+    '''用来计算cos和sin，并传给rope直接使用。cos和sin只需要计算一次就可以缓存到buffer里面，并且在seq_len超出已缓存的范围时重新动态计算'''
     def __init__(self, head_dim, max_position_embeddings=2048, base=10000.0, device=None):
         super().__init__()
         self.head_dim = head_dim

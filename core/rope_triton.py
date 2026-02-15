@@ -1,10 +1,11 @@
-# triton实现的rope
+'''triton实现的rope，接收x和预缓存的cos和sin，然后应用到x上'''
 
 import torch
 import triton
 import triton.language as tl
 
 class TritonRoPE(torch.autograd.Function):
+    '''triton实现的rope，接收x和预缓存的cos和sin，然后应用到x上'''
     @staticmethod
     def forward(ctx, x, cos, sin):
         # 这里的cos和sin是预计算好的不同token位置的cos和sin，本程序要做的只是把计算好的cos和sin应用到x上
