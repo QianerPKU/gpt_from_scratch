@@ -3,3 +3,6 @@ test_correctness.py
 test_train_loop.py
 data/wikitext_bin/
 profile_train.py
+naive_gpt.py
+naive_train.py
+benchmark.py
