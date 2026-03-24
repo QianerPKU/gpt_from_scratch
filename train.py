@@ -9,7 +9,28 @@ from core.data import create_distributed_dataloader
 from core.optimizer import DistributedOptimizer
 from core.models.gpt import GPTModel
 from core.parallel_state import initialize_parallel_state
+from core.profiling import PhaseLogAccumulator, StepPhaseProfiler
 from core.tensor_parallel.loss import _VocabParallelCrossEntropy
+
+PHASE_LOG_ORDER = (
+    'data_wait',
+    'h2d',
+    'forward',
+    'loss',
+    'backward',
+    'optimizer_rs',
+    'clip_grad',
+    'optimizer_step',
+    'param_ag',
+    'idle_sync',
+    'step_core_wall',
+)
+MEMORY_LOG_ORDER = (
+    'alloc_mb',
+    'reserved_mb',
+    'peak_alloc_mb',
+    'peak_reserved_mb',
+)
 
 
 @dataclass
@@ -49,6 +70,8 @@ def parse_args():
     parser.add_argument('--max-steps', type=int, default=100000)
     parser.add_argument('--clip-grad', type=float, default=1.0)
     parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--profile-phases', action='store_true',
+                        help='启用 step 级 phase 计时和显存统计')
 
     # 并行参数
     parser.add_argument('--tensor-model-parallel-size', type=int, default=1)
@@ -85,6 +108,40 @@ def warmup_triton(args):
         out.backward(torch.randn_like(out))
 
     torch.cuda.synchronize()
+
+
+def reduce_phase_metrics(phase_totals, memory_max):
+    phase_tensor = torch.tensor(
+        [phase_totals.get(name, 0.0) for name in PHASE_LOG_ORDER],
+        device='cuda',
+        dtype=torch.float64,
+    )
+    memory_tensor = torch.tensor(
+        [memory_max.get(name, 0.0) for name in MEMORY_LOG_ORDER],
+        device='cuda',
+        dtype=torch.float64,
+    )
+    dist.all_reduce(phase_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(memory_tensor, op=dist.ReduceOp.MAX)
+    phase_tensor /= dist.get_world_size()
+    return (
+        {name: phase_tensor[idx].item() for idx, name in enumerate(PHASE_LOG_ORDER)},
+        {name: memory_tensor[idx].item() for idx, name in enumerate(MEMORY_LOG_ORDER)},
+    )
+
+
+def format_phase_log(phase_times, memory_stats):
+    phase_summary = " | ".join(
+        f"{name}:{phase_times[name]:.1f}ms"
+        for name in PHASE_LOG_ORDER
+    )
+    memory_summary = (
+        f"alloc:{memory_stats['alloc_mb']:.0f}MB | "
+        f"reserved:{memory_stats['reserved_mb']:.0f}MB | "
+        f"peak_alloc:{memory_stats['peak_alloc_mb']:.0f}MB | "
+        f"peak_reserved:{memory_stats['peak_reserved_mb']:.0f}MB"
+    )
+    return phase_summary, memory_summary
 
 
 def main():
@@ -157,34 +214,64 @@ def main():
     epoch = 0
     log_loss = 0.0
     log_start_time = time.time()
+    phase_profiler = StepPhaseProfiler(enabled=args.profile_phases)
+    phase_accumulator = PhaseLogAccumulator() if args.profile_phases else None
 
     while step < args.max_steps:
         sampler.set_epoch(epoch)
+        data_iter = iter(dataloader)
 
-        for batch in dataloader:
-            if step >= args.max_steps:
+        while True:
+            data_wait_start = time.perf_counter() if args.profile_phases else None
+            try:
+                batch = next(data_iter)
+            except StopIteration:
                 break
 
-            inputs = batch['input'].cuda() # [B, S],token ids
-            labels = batch['label'].cuda() # [B, S],shifted targets
+            if step >= args.max_steps:
+                break
 
             # 清零梯度（不能设None，因为grad指针指向grad_buffer）
             optimizer.zero_grad()
 
+            if args.profile_phases:
+                phase_profiler.start_step()
+                data_wait_ms = (time.perf_counter() - data_wait_start) * 1000.0
+                phase_profiler.add_cpu_phase('data_wait', data_wait_ms)
+
+            phase_name = phase_profiler.start_gpu_phase('h2d') if args.profile_phases else None
+            inputs = batch['input'].cuda() # [B, S],token ids
+            labels = batch['label'].cuda() # [B, S],shifted targets
+            if args.profile_phases:
+                phase_profiler.end_gpu_phase(phase_name)
+
             # 前向传播
+            phase_name = phase_profiler.start_gpu_phase('forward') if args.profile_phases else None
             logits = model(inputs) # [S, B, V/P]
+            if args.profile_phases:
+                phase_profiler.end_gpu_phase(phase_name)
 
             # 计算TP并行的交叉熵损失
             # labels需要从[B, S]转为[S, B]以匹配logits的形状
+            phase_name = phase_profiler.start_gpu_phase('loss') if args.profile_phases else None
             labels_t = labels.transpose(0, 1).contiguous()  # [S, B]
             loss = _VocabParallelCrossEntropy.apply(logits, labels_t)  # [S, B]
             loss = loss.mean()
+            if args.profile_phases:
+                phase_profiler.end_gpu_phase(phase_name)
 
             # 反向传播：梯度自动累积到grad_buffer中
+            phase_name = phase_profiler.start_gpu_phase('backward') if args.profile_phases else None
             loss.backward()
+            if args.profile_phases:
+                phase_profiler.end_gpu_phase(phase_name)
 
             # 优化器步骤：reduce-scatter梯度 -> clip -> fp32 step -> all-gather参数
-            optimizer.step()
+            optimizer.step(phase_profiler if args.profile_phases else None)
+
+            if args.profile_phases:
+                phase_times, memory_stats = phase_profiler.finalize_step()
+                phase_accumulator.update(phase_times, memory_stats)
 
             step += 1
             log_loss += loss.item()
@@ -202,11 +289,37 @@ def main():
                           f"Loss: {avg_loss:.4f} | "
                           f"Tokens/s: {tokens_per_sec:.0f} | "
                           f"Time: {elapsed:.1f}s")
+                if args.profile_phases:
+                    avg_phase_times, max_memory_stats = reduce_phase_metrics(
+                        phase_accumulator.average_times(),
+                        phase_accumulator.memory_max,
+                    )
+                    if rank == 0:
+                        phase_summary, memory_summary = format_phase_log(
+                            avg_phase_times,
+                            max_memory_stats,
+                        )
+                        print(f"Phase Avg | {phase_summary}")
+                        print(f"Memory Max | {memory_summary}")
+                    phase_accumulator.reset()
 
                 log_loss = 0.0
                 log_start_time = time.time()
 
         epoch += 1
+
+    if args.profile_phases and phase_accumulator.steps > 0:
+        avg_phase_times, max_memory_stats = reduce_phase_metrics(
+            phase_accumulator.average_times(),
+            phase_accumulator.memory_max,
+        )
+        if rank == 0:
+            phase_summary, memory_summary = format_phase_log(
+                avg_phase_times,
+                max_memory_stats,
+            )
+            print(f"Phase Avg | {phase_summary}")
+            print(f"Memory Max | {memory_summary}")
 
     # 训练结束
     if rank == 0:

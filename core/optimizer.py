@@ -1,6 +1,5 @@
 import torch
 import torch.distributed as dist
-import math
 from core.parallel_state import get_data_parallel_group, get_data_parallel_group_rank, get_data_parallel_world_size
 
 class DistributedOptimizer():
@@ -76,23 +75,42 @@ class DistributedOptimizer():
         '''用来清零梯度，注意不能把grad设为none，不然我们重定向的指针就废了'''
         self.grad_buffer.zero_()
 
-    def step(self):
+    def step(self, phase_profiler=None):
         # loss backward已经填满了grad buffer，需要先reduce scatter到reduced_grad_shard
+        if phase_profiler is not None:
+            phase_profiler.start_gpu_phase('optimizer_rs')
         dist.reduce_scatter_tensor(self.reduced_grad_shard, self.grad_buffer, group=self.dp_group)
+        if phase_profiler is not None:
+            phase_profiler.end_gpu_phase('optimizer_rs')
 
         # 执行梯度裁剪
         if self.clip_grad is not None and self.clip_grad > 0.0:
+            if phase_profiler is not None:
+                phase_profiler.start_gpu_phase('clip_grad')
             self._clip_grad_norm()
+            if phase_profiler is not None:
+                phase_profiler.end_gpu_phase('clip_grad')
+        elif phase_profiler is not None:
+            phase_profiler.start_gpu_phase('clip_grad')
+            phase_profiler.end_gpu_phase('clip_grad')
 
         # 将reduced_grad_shard的梯度更新到fp32_master_shard
+        if phase_profiler is not None:
+            phase_profiler.start_gpu_phase('optimizer_step')
         self.fp32_master_shard.grad = self.reduced_grad_shard.to(self.fp32_master_shard.dtype)
 
         # 更新fp32_master_shard，并清理梯度
         self.optimizer.step()
         self.optimizer.zero_grad()
+        if phase_profiler is not None:
+            phase_profiler.end_gpu_phase('optimizer_step')
 
         # 将fp32_master_shard的梯度all gather到bf16的param buffer，注意先转回bf16
+        if phase_profiler is not None:
+            phase_profiler.start_gpu_phase('param_ag')
         dist.all_gather_into_tensor(self.param_buffer, self.fp32_master_shard.to(self.dtype), group=self.dp_group)
+        if phase_profiler is not None:
+            phase_profiler.end_gpu_phase('param_ag')
         # 由于模型的参数是指向param buffer的，所以all gather之后模型的参数也会更新，不用再做任何copy了
 
     def _clip_grad_norm(self):
